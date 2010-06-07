@@ -1,0 +1,12 @@
+<?php
+
+/**
+ * @file
+ * uc_hsbc module
+ */
+
+function uc_hsbc_uninstall() {
+  // Remove variables.
+  db_query("DELETE FROM {variable} WHERE name LIKE 'uc_hsbc_%'");
+  cache_clear_all('variables', 'cache');
+}

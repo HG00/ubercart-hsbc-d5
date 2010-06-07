@@ -1,0 +1,516 @@
+<?php
+
+/**
+ * HSBC PCI integration for ubercart
+ * By Hamish Gough
+ * email hamish AT hamishgough DOT com
+ *
+ * Released subject to the GPL
+ * Please see <http://www.gnu.org/licenses/>
+ *
+ * This version is a modification of Dublin Drupaller's 
+ * HSBC CPI implementation for drupal ecommerce
+ * available at http://drupal.org/project/ec_hsbc.
+*/
+
+/**
+ * Implementation of hook_help().
+ */
+function uc_hsbc_help($section = 'admin/help#uc_hsbc') {
+  switch ($section) {
+    case 'admin/help#uc_hsbc':
+      return t('This module enables payment via HSBC payment page / CPI.');
+  }
+}
+
+/**
+ * Implementation of hook_menu().
+ */
+function uc_hsbc_menu($may_cache) {
+  $uc_hsbc_callback_url = variable_get('uc_hsbc_callback_url', 'uc_hsbc_callback');
+  $uc_hsbc_validate_url = variable_get('uc_hsbc_cpidirectresulturl', 'uc_hsbc_check');
+  if ($may_cache) {
+    $items[] = array(
+      'path' => $uc_hsbc_callback_url,
+      'title' => t('Order Validation'),
+      'callback' => 'uc_hsbc_callback_process',
+      'access' => user_access('access content'),
+      'type' => MENU_CALLBACK,
+    );
+    $items[] = array(
+      'path' => $uc_hsbc_validate_url,
+      'title' => t('HSBC Validate'),
+      'callback' => 'uc_hsbc_validation_process',
+      'access' => TRUE,
+      'type' => MENU_CALLBACK,
+      );
+  }
+  return $items;
+}
+
+/**
+ * Implementation of hook_form_alter().
+ */
+function uc_hsbc_form_alter($form_id, &$form) {
+  if ($form_id == 'uc_cart_checkout_review_form' && ($order_id = intval($_SESSION['cart_order'])) > 0) {
+    $order = uc_order_load($order_id);
+    if ($order->payment_method == 'hsbc') {
+      unset($form['submit']);
+      $form['#prefix'] = '<table style="display: inline; padding-top: 1em;"><tr><td>';
+      $form['#suffix'] = '</td><td>'. drupal_get_form('uc_hsbc_form', $order) .'</td></tr></table>';
+    }
+  }
+}
+
+/**
+ * HSBC CHECKOUT FORM.
+ */
+function uc_hsbc_form($order) {
+  global $base_url;
+  $secureurl = str_replace('http://', 'https://', $base_url);
+  $country = $order->billing_country;
+  if ($country === FALSE) { $country = '826'; };
+  // make sure HSBC is being bounced back to a https page for validation and callback
+  // pull together the order details and variables to generate the checkout form.
+  $uc_hsbc_url = variable_get('uc_hsbc_url', 'https://www.cpi.hsbc.com/servlet');
+  $formdata_basic = array(
+    'CpiDirectResultUrl' => ''.  $secureurl .'/'. variable_get('uc_hsbc_cpidirectresulturl', 'uc_hsbc_validate'),
+    'CpiReturnUrl' => '' . $secureurl . '/' . variable_get('uc_hsbc_callback_url', 'uc_hsbc_callback'),
+    // Put the cart id in here so we can clear it if the order succeeds
+    // HSBC will post this back to the validate url
+    'MerchantData' => uc_cart_get_id(),
+    'Mode' => variable_get('uc_hsbc_productionmode', 't'),
+    'OrderDesc' => "EFD Shop order #" . $order->order_id,
+    'OrderId' => $order->order_id,
+    'PurchaseAmount' => $order->order_total * 100,
+    'PurchaseCurrency' => variable_get('uc_hsbc_currency_code', '826'),
+    'StorefrontId' => variable_get('uc_hsbc_storefrontid', 'UK12345678CUR'),
+    'TimeStamp' => time()."000",
+    'TransactionType' => variable_get('uc_hsbc_transactiontype', 'auth'),
+    'UserId' => $order->uid,
+  );
+  // Array for optional submission data
+  // If we submit some billing/shipping data, then
+  // we must submit all CPI required data for this section
+  if (variable_get('uc_hsbc_send_address', FALSE)) {
+    $formdata_shipping = array(
+      'BillingAddress1' => $order->billing_street1,
+      'BillingAddress2' => $order->billing_street2,
+      'BillingCity' => $order->billing_city,
+      'BillingCountry' => $country,
+      'BillingFirstName' => $order->billing_first_name,
+      'BillingLastName' => $order->billing_last_name,
+      'BillingPostal' => $order->billing_postal_code,
+      'ShopperEmail' => $order->primary_email,
+      // Shipping 
+      // These may be unset for non-shippable items, but HSBC will 
+      // reject the order if both arent available, so we copy them 
+      // from the billing details if needed
+      'ShippingAddress1' => $order->delivery_street1 ? $order->delivery_street1 : $order->billing_street1,
+      'ShippingAddress2' => $order->delivery_street2 ? $order->delivery_street2 : $order->billing_street2,
+      'ShippingCity' => $order->delivery_city ? $order->delivery_city : $order->billing_city,
+      'ShippingCountry' => $country,
+      'ShippingFirstName' => $order->delivery_first_name ? $order->delivery_first_name : $order->billing_first_name,
+      'ShippingLastName' => $order->delivery_last_name ? $order->delivery_last_name : $order->billing_last_name,
+      'ShippingPostal' => $order->delivery_postal_code ? $order->delivery_postal_code : $order->billing_postal_code,
+    );
+  };
+  // merge the basic and optional form data
+  $formdata = array_merge($formdata_basic, $formdata_shipping);
+  // prepare hash data array from form fields
+  $hash_data = array();
+  foreach ($formdata as $k => $v) {
+    $hash_data[] = $v;
+  }
+  $sharedsecret = variable_get('uc_hsbc_cpihashkey', '0000');
+  // generate hash code
+  $formdata['OrderHash'] = uc_hsbc_generatehash($hash_data, $sharedsecret);
+  // pump out the form fields
+  foreach ($formdata as $k => $v){
+    $form[$k] = array('#type' => 'hidden', '#value' => $v);
+  }
+  $form['#action'] = $uc_hsbc_url;
+  $form['#method'] = 'POST';
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Submit order'),
+  );
+  
+  return $form;
+}
+
+/**
+ * Implementation of hook_payment_method().
+ */
+function uc_hsbc_payment_method() {
+  $path = base_path() . drupal_get_path('module', 'uc_hsbc');
+  $title = variable_get('uc_hsbc_method_title', t('HSBC credit card payments'));
+  $methods[] = array(
+    'id' => 'hsbc',
+    'name' => t('hsbc'),
+    'title' => $title,
+    'review' => t('Credit card'),
+    'desc' => t('Redirect to HSBC secure page to pay by credit card.'),
+    'callback' => 'uc_payment_method_hsbc',
+    'weight' => 3,
+    'checkout' => TRUE,
+    'backend' => TRUE,
+  );
+  return $methods;
+}
+
+/**
+ * Callback for hsbc payment method settings.
+ */
+function uc_payment_method_hsbc($op, &$arg1) {
+  switch ($op) {
+    case 'settings':
+      global $base_url;
+      $secureurl = str_replace('http://', 'https://', $base_url);
+      $output = '';
+      // HSBC Storefront ID (uc_hsbc_storefrontid)
+      $form['uc_hsbc_storefrontid'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Storefront Id (13 char string)'),
+        '#default_value' => variable_get('uc_hsbc_storefrontid', 'UK12345678CUR'),
+        '#size' => 20,
+        '#maxlength' => 255,
+        '#description' => t('HSBC Storefront ID. This should be set to your unique shopfront ID (a 13 character string), which was given to you by HSBC. Example: UK12345678CUR. It contains both the country and currency for which your account was setup for.'),
+      );
+      // HSBC CPI hash key (uc_hsbc_cpihashkey)
+      $form['uc_hsbc_cpihashkey'] = array(
+        '#type' => 'textfield',
+        '#title' => t('CPI hash key (32 char string)'),
+        '#default_value' => variable_get('uc_hsbc_cpihashkey', '0000'),
+        '#size' => 45,
+        '#maxlength' => 255,
+        '#description' => t('The HSBC CPI hash key (also known as the "shared secret") is sent in a letter to you after your CPI service is activated. The value is exactly 32 characters in length, case sensitive, and specific both to you and the associated CPI service. If you have more than one CPI service (e.g. multiple currencies) you will receive one CPI Hash Key for each CPI service. This must be kept confidential.'),
+      );
+      // hsbc processing URL
+      $form['uc_hsbc_url'] = array(
+        '#type' => 'textfield',
+        '#title' => t('HSBC processing URL'),
+        '#default_value' => variable_get('uc_hsbc_url', 'https://www.cpi.hsbc.com/servlet'),
+        '#size' => 60,
+        '#maxlength' => 180,
+        '#description' => t('URL of the secure payment page customers are sent to for payment processing. If unsure leave at default setting.'),
+      );
+      $form['uc_hsbc_cpidirectresulturl'] = array(
+        '#type' => 'textfield',
+        '#title' => t('HSBC CPI Direct Result URL'),
+        '#default_value' => variable_get('uc_hsbc_cpidirectresulturl', 'uc_hsbc_check'),
+        '#size' => 45,
+        '#maxlength' => 255,
+        '#description' => t('The link that HSBC uses to validate a transaction. Do not change from the default unless you know what you are doing. Currently set to: <strong>'.  $secureurl .'/'. variable_get('uc_hsbc_cpidirectresulturl', 'uc_hsbc_validate') .'</strong>'),
+      );
+      $form['uc_hsbc_callback_url'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Thank you page/hsbc callback URL'),
+        '#default_value' => variable_get('uc_hsbc_callback_url', 'uc_hsbc_callback'),
+        '#size' => 60,
+        '#maxlength' => 180,
+        '#description' => t('The page displayed to the customer after returning from the HSBC site. Do not change from the default unless you know what you are doing. Currently set to: <strong>'.  $secureurl .'/'. variable_get('uc_hsbc_callback_url', 'uc_hsbc_callback') .'</strong>'),
+      );
+      // HSBC transaction mode
+      $transactiontype = array('Auth' => 'Auth mode', 'Capture' => 'Capture mode');
+      $form['uc_hsbc_transactiontype'] = array(
+        '#type' => 'select',
+        '#title' => t('HSBC Transaction Type'),
+        '#default_value' => variable_get('uc_hsbc_transactiontype', 'Auth'),
+        '#options' => $transactiontype,
+        '#description' => t('<p>An <strong>AUTH</strong> transaction places a reserve on the cardholders open-to-buy balance, the cardholders available balance remains unchanged. Once the goods have been confirmed as "shipped", you will use the Virtual Terminal to mark the order as "shipped". This process then automatically marks the funds ready for settlement. (This corresponds to a "PreAuth" in the Virtual Terminal.)</p><p>A <strong>CAPTURE</strong> transaction verifies the cardholders account to be in good standing, and automatically marks the funds ready for settlement. This is typically used for goods that do not need to be physically shipped (for example, a software download). (This corresponds to an "Auth" in the Virtual Terminal.)</p>'),
+      );
+      // HSBC transaction mode
+      $productionmode = array('T' => 'Test', 'P' => 'Production');
+      $form['uc_hsbc_productionmode'] = array(
+        '#type' => 'select',
+        '#title' => t('HSBC Production Mode'),
+        '#default_value' => variable_get('uc_hsbc_productionmode', 'T'),
+        '#options' => $productionmode,
+        '#description' => t('<p><strong>PRODUCTION</strong> - The customer will be billed for the order. <br /><strong>TEST</strong> - No money will be taken.</p>'),
+      );
+      // Currency code (currency)
+      $currency_codes = array('826' => 'GBP - Pounds Sterling', '840' => 'USD - U.S. Dollars', '978' => 'EUR - Euros', '036' => 'AUD - Australian Dollars', '124' => 'CAD - Canadian Dollars');
+      $form['uc_hsbc_currency_code'] = array(
+        '#type' => 'select',
+        '#title' => t('HSBC Currency code (currency)'),
+        '#default_value' => variable_get('uc_hsbc_currency_code', '826'),
+        '#options' => $currency_codes,
+        '#description' => t('The currecy code that HSBC should process the payment in.'),
+      );
+      // HSBC Minimum Amount
+      $form['uc_hsbc_min_amount'] = array(
+        '#type' => 'textfield',
+        '#title' => t('HSBC Minimum Amount'),
+        '#default_value' => variable_get('uc_hsbc_min_amount', '1'),
+        '#size' => 10,
+        '#maxlength' => 10,
+        '#description' => t('The minimum purchase amount (gross) that will be accepted for HSBC payments.'),
+      );
+      // HSBC customer email - we dont do this here as uc sends its own email
+      //$form['uc_hsbc_customeremail'] = array(
+      //  '#type' => 'checkbox',
+      //  '#title' => t('Send an email invoice to the customer'),
+      //  '#default_value' => variable_get('uc_hsbc_customeremail', 1),
+      //  '#description' => t('Select if you want the HSBC module to automatically send an invoice when there is a completed payment.'),
+      //);
+      // HSBC mark transaction as completed.
+      $form['uc_hsbc_txn_completed'] = array(
+        '#type' => 'radios',
+        '#title' => t('Mark transaction workflow as completed?'),
+        '#default_value' => variable_get('uc_hsbc_txn_completed', 0),
+        '#options' => array(t('No'), t('Yes')),
+        '#description' => t('Marks transactions as completed in the workflow (e.g. when selling downloads).')
+      );
+      // send billing and shipping data
+      $form['uc_hsbc_send_address'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Send customer shipping and billing details to HSBC'),
+        '#default_value' => variable_get('uc_hsbc_send_address', 1),
+        '#description' => t('Select if you would like to send customer shipping and billing info to HSBC.'),
+      );
+      $form['uc_hsbc_finalscreen'] = array(
+        '#type' => 'textarea',
+        '#title' => t('Connect to HSBC description'),
+        '#default_value' => variable_get('uc_hsbc_finalscreen', '<h2>Thank you for submitting your order</h2><p>Thank you for your order. We are now redirecting you to our secure payment provider to make a credit/debit card payment. If javascript is disabled, click on the button below.</p>'),
+        '#cols' => 60,
+        '#rows' => 2,
+        '#description' => t('Insert your own HTML message that is displayed to the customer before being transferred across to the HSBC server on checkout.'),
+      );
+      $form['uc_hsbc_payment_complete'] = array(
+        '#type' => 'textarea',
+        '#title' => t('uc_hsbc_callback - Payment Completed message'),
+        '#default_value' => variable_get('uc_hsbc_payment_complete', '<h1>Payment Completed</h1><p>HSBC has accepted your card and payment has been made. Thank you. An email has been sent confirming your order.</p>'),
+        '#cols' => 60,
+        '#rows' => 5,
+        '#description' => t('Insert your own message that is displayed when a payment is completed using uc_hsbc_callback'),
+        );
+      $form['uc_hsbc_payment_cancelled'] = array(
+        '#type' => 'textarea',
+        '#title' => t('uc_hsbc_callback - Order Cancelled message'),
+        '#default_value' => variable_get('uc_hsbc_payment_cancelled', '<h1>Payment Cancelled</h1><p>HSBC has indicated that you cancelled your order. Please try again or to contact us if you are having difficulties.</p>'),
+        '#cols' => 60,
+        '#rows' => 5,
+        '#description' => t('Insert your own message that is displayed when a payment is cancelled using uc_hsbc_callback'),
+        );
+      $form['uc_hsbc_payment_review'] = array(
+        '#type' => 'textarea',
+        '#title' => t('uc_hsbc_callback - Payment under review message'),
+        '#default_value' => variable_get('uc_hsbc_payment_review', '<h1>Payment Under Review</h1><p>HSBC has indicated that payment authorisation for your order is pending, we will process your order once it is complete. </p>'),
+        '#cols' => 60,
+        '#rows' => 5,
+        '#description' => t('Insert your own message that is displayed when a payment is marked as under review by HSBC Fraudshield'),
+        );
+      $form['uc_hsbc_server_fail'] = array(
+        '#type' => 'textarea',
+        '#title' => t('uc_hsbc_callback - server validation check failed message'),
+        '#default_value' => variable_get('uc_hsbc_server_fail', '<h1>Sorry!</h1><p>We were unable to validate your request with the HSBC server. Please click through to our <a href="product">products page</a> to try again or to contact us if you are having difficulties.</p>'),
+        '#cols' => 60,
+        '#rows' => 5,
+        '#description' => t('Insert your own message that is displayed when the hsbc server validation check fails using uc_hsbc_callback'),
+        );
+      $form['uc_hsbc_debug_option'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Switch debug on to display hsbc feedback and data while testing the uc_hsbc_callback page.'),
+        '#return_value' => 1,
+        '#default_value' => variable_get('uc_hsbc_debug_option', 0),
+        '#description' => t('If this option is enabled, hsbc callback data will be displayed in full at the bottom of your uc_hsbc_callback page.'),
+      );
+    return $form;
+  }
+}
+
+/**
+* Generate order Hash key - completely copied from ec_hsbc module
+*
+* @param Array $vector
+* @param String $s
+* @return String $ret
+*/
+function uc_hsbc_generatehash($vector, $s) {
+  // pull up the helper class for generating the HSBC order hash
+  include_once(drupal_get_path('module', 'uc_hsbc') .'/uc_hsbc_hash.inc');
+  $vector1 = array();
+  for ($i = 0; $i < sizeof($vector); $i++) {
+    $flag = false;
+    $s2 = $vector[$i];
+    $vSize= sizeof($vector1);
+    for($k = 0; $k < $vSize && !$flag; $k++) {
+      $s4 = $vector1[$k];
+      $l = strcmp($s2, $s4);
+        if ($l <= 0)  {
+          array_push($vector1, '');
+           for ($r = sizeof($vector1)-2; $r >= $k; $r--)
+             $vector1[$r+1] = $vector1[$r];
+             $vector1[$k] = $s2;
+             $flag = true;
+        }
+     }
+   if(!$flag) array_push($vector1, $s2);
+   }
+  $s1 = '';
+  for($j = 0; $j < sizeof($vector1); $j++) {
+    $s3 = $vector1[$j];
+    $s1 = $s1 . $s3;
+    }
+  $orderCrypto = new orderCrypto();
+  $abyte0 = $orderCrypto->decryptToBinary($s);
+  $ret = base64_encode(mhash(MHASH_SHA1, $s1.$abyte0, $abyte0));
+  return $ret;
+}
+
+function uc_hsbc_validation_process() {
+    // We need to test whether the data has been tampered with
+  $CpiResultsCode = $_POST['CpiResultsCode'];
+  $postFields = array($CpiResultsCode, $_POST['PurchaseDate'], $_POST['MerchantData'], $_POST['OrderId'], $_POST['PurchaseAmount'], $_POST['PurchaseCurrency'], $_POST['ShopperEmail'], $_POST['StorefrontId']);
+  $sharedsecret = variable_get('uc_hsbc_cpihashkey', '0000');
+  $OrderHash = $_POST['OrderHash'];
+  if ($OrderHash == uc_hsbc_generatehash($postFields, $sharedsecret)) {
+    $validorder = "1";
+    }
+  if ($validorder == "1") {
+    watchdog('uc_hsbc', t('Receiving new order notification for order !order_id.', array('!order_id' => check_plain($_POST['OrderId']))));
+    switch ($CpiResultsCode) {
+      case 0:
+        watchdog('uc_hsbc', t('HSBC code #0 The transaction was approved. (Order ID: #'. $_POST['OrderId'] .')'));
+        $comment = t('Paid via hsbc cpi. Order #!order.', array('!order' => check_plain($_POST['OrderId'])));
+        uc_payment_enter($_POST['OrderId'], 'hsbc', $_POST['PurchaseAmount']/100, 0, NULL, $comment);
+        $order = uc_order_load($_POST['OrderId']);
+        uc_cart_empty($_POST['MerchantData']);
+        uc_cart_complete_sale($order);
+        uc_order_comment_save($order->order_id, 1, t('Order created through website.'), 'admin');
+        break;
+      case 1:
+        watchdog('uc_hsbc', t('HSBC Error #1 The user cancelled the transaction. (Order ID: #'. $_POST['OrderId'] .')'));
+        break;
+      case 2:
+        watchdog('uc_hsbc', t('HSBC Error #2 The processor declined the transaction for an unknown reason. (Order ID: #'. $_POST['OrderId'] .')'));
+        break;
+      case 3:
+        watchdog('uc_hsbc', t('HSBC Error #3 The transaction was declined because of a problem with the card. For example, an invalid card number or expiration date was specified. (Order ID: #'. $_POST['OrderId'] .')'));
+        break;
+      case 4:
+        watchdog('uc_hsbc', t('HSBC Error #4 The processor did not return a response. (Order ID: #'. $_POST['OrderId'] .')'));
+        break;
+      case 5:
+        watchdog('uc_hsbc', t('HSBC Error #5 The amount specified in the transaction was either too high or too low for the processor. (Order ID: #'. $_POST['OrderId'] .')'));
+        break;
+      case 6:
+        watchdog('uc_hsbc', t('HSBC Error #6 The specified currency is not supported by either the processor or the card. (Order ID: #'. $_POST['OrderId'] .')'));
+        break;
+      case 7:
+        watchdog('uc_hsbc', t('HSBC Error #7 The order is invalid because the order ID is a duplicate. (Order ID: #'. $_POST['OrderId'] .')'));
+        break;
+      case 8:
+        watchdog('uc_hsbc', t('HSBC Error #8 The transaction was rejected by FraudShield. (Order ID: #'. $_POST['OrderId'] .')'));
+        break;
+      case 9:
+        watchdog('uc_hsbc', t('HSBC Error #9 The transaction was placed in Review state by FraudShield. (Order ID: #'. $_POST['OrderId'] .')'));
+        $comment = t('Order in review state at hsbc cpi. Order #!order.', array('!order' => check_plain($_POST['OrderId'])));
+        uc_payment_enter($_POST['OrderId'], 'hsbc', $_POST['PurchaseAmount']/100, 0, NULL, $comment);
+        $order = uc_order_load($_POST['OrderId']);
+        uc_cart_empty($_POST['MerchantData']);
+        uc_cart_complete_sale($order);
+        uc_order_comment_save($order->order_id, 1, t('WARNING! Order under review at HSBC.'), 'admin');
+        break;
+      case 10:
+        watchdog('uc_hsbc', t('HSBC Error #10 The transaction failed because of invalid input data. (Order ID: #'. $_POST['OrderId'] .')'));
+        break;
+      case 11:
+        watchdog('uc_hsbc', t('HSBC Error #11 The transaction failed because the CPI was configured incorrectly. (Order ID: #'. $_POST['OrderId'] .')'));
+        break;
+      case 12:
+        watchdog('uc_hsbc', t('HSBC Error #12 The transaction failed because the Storefront was configured incorrectly. (Order ID: #'. $_POST['OrderId'] .')' ));
+        break;
+      case 13:
+        watchdog('uc_hsbc', t('HSBC Error #13 The connection timed out. (Order ID: #'. $_POST['OrderId'] .')'));
+        break;
+      case 14:
+        watchdog('uc_hsbc', t('HSBC Error #14 The transaction failed because the cardholder\'s browser refused a cookie. (Order ID: #'. $_POST['OrderId'] .')'));
+        break;
+      case 15:
+        watchdog('uc_hsbc', t('HSBC Error #15 The customer\'s browser does not support 128-bit encryption. (Order ID: #'. $_POST['OrderId'] .')'));
+        break;
+      case 16:
+        watchdog('uc_hsbc', t('HSBC Error #16 The CPI cannot communicate with the Payment Engine. (Order ID: #'. $_POST['OrderId'] .')'));
+        break;
+      }
+  return 'ok';
+  }
+  return 'Please use the menu to navigate the site.';
+}
+
+function uc_hsbc_callback_process() {
+  $CpiResultsCode = $_POST['CpiResultsCode'];
+  $Orderhash = $_POST['OrderHash'];
+  // Catch the incoming results from HSBC and display an appropriate message to customers
+  if (isset($Orderhash)) {
+      switch ($CpiResultsCode) {
+        case 0: // The payment is complete
+          global $conf;
+          $uc_hsbc_complete_name = 'uc_hsbc_payment_complete';
+          $uc_hsbc_complete_default = t('<h1>Payment Complete.</h1><p>HSBC has accepted your card and payment has been made. Thank you.');
+          $output .= (isset($conf[$uc_hsbc_complete_name]) ? $conf[$uc_hsbc_complete_name] : $uc_hsbc_complete_default);
+          break;
+        case 1: // The customer cancelled the payment at the HSBC screen
+          global $conf;
+          $uc_hsbc_cancelled_name = 'uc_hsbc_payment_cancelled';
+          $uc_hsbc_cancelled_default = t('<h1>Payment Cancelled.</h1><p>HSBC has indicated that you have cancelled your order. Please try again or <a href="">contact us</a> if you are having difficulties.</p>');
+          $output .= (isset($conf[$uc_hsbc_cancelled_name]) ? $conf[$uc_hsbc_cancelled_name] : $uc_hsbc_cancelled_default);
+          break;
+        case 9: // HSBC FraudShield has marked the payment for review
+          global $conf;
+          $uc_hsbc_underreview_name = 'uc_hsbc_payment_review';
+          $uc_hsbc_underreview_default = t('<h1>Payment Under Review</h1><p>HSBC has indicated that Payment authorisation for your order is pending, we will process your order once it is complete.</p>');
+          $output .= (isset($conf[$uc_hsbc_underreview_name]) ? $conf[$uc_hsbc_underreview_name] : $uc_hsbc_underreview_default);
+          break;
+        default: // Everything else is an error
+          global $conf;
+          $uc_hsbc_failed_name = 'uc_hsbc_server_fail';
+          $uc_hsbc_failed_default = t('<h1>Sorry!</h1><p>We were unable to validate your request with the HSBC server. Please try again or <a href="">contact us</a> if you are having difficulties.</p>');
+          $output .= (isset($conf[$uc_hsbc_failed_name]) ? $conf[$uc_hsbc_failed_name] : $uc_hsbc_failed_default);
+        break;
+      }
+    }
+  else {
+    global $conf;
+    $uc_hsbc_failed_name = 'uc_hsbc_server_fail';
+    $uc_hsbc_failed_default = t('<h1>Sorry!</h1><p>We were unable to validate your request with the HSBC server. Please try again or <a href="/contact-us">contact us</a> if you are having difficulties.</p>');
+    $output .= (isset($conf[$uc_hsbc_failed_name]) ? $conf[$uc_hsbc_failed_name] : $uc_hsbc_failed_default);
+  }
+  global $base_url;
+  drupal_set_html_head("<base href=\"$base_url/\" />\n");
+  init_theme();
+  global $conf;
+  $uc_hsbc_debug_name = 'uc_hsbc_debug_option';
+  $uc_hsbc_debug_default = '0';
+  $uc_hsbc_debug = (isset($conf[$uc_hsbc_debug_name]) ? $conf[$uc_hsbc_debug_name] : $uc_hsbc_debug_default);
+  if ((($uc_hsbc_debug) == '1') && (user_access('administer store'))) {
+     // table dump of values from the hsbc server
+    $output .= '<table border="1" width="400px" cellpadding="3" cellspacing="0"><tr><th colspan="2" align="left">POST information received<br />(Generally, form submission)</th></tr>';
+    $output .= '<tr><th align="left">Key</th><th align="left">Value</th></tr>';
+    if (count($_POST)) {
+      ksort($_POST);
+      foreach ($_POST as $k => $v) {
+        $output .= "<tr><td>$k</td><td>$v</td></tr>";
+        }
+      }
+    else {
+      $output .= '<tr><td colspan="2" align="center">[no POST information received]</td></tr>';
+      }
+    $output .= '</table><br/><br/>';
+    $output .= '<table border="1" cellpadding="3"  width="400px" cellspacing="0"><tr><th colspan="2" align="left">Server $_SERVER array values</th></tr><tr><th align="left">Key</th><th align="left">Value</th></tr>';
+    if ( count($_SERVER) ) {
+      ksort($_SERVER);
+      foreach ($_SERVER as $k => $v) {
+        $output .= "<tr><td>$k</td><td>$v</td></tr>";
+         }
+      }
+      else {
+        $output .='<tr><td colspan="2" align="center">[no $_SERVER array available]</td></tr>';
+        }
+    $output .= '</table><br><br>';
+    }
+  return $output;
+}
+?>
